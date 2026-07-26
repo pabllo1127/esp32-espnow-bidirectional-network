@@ -1,0 +1,463 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
+#include "esp_wifi.h"
+
+#define TFT_RST  4
+#define TFT_DC   5
+#define TFT_CS   10
+#define TFT_MOSI 11
+#define TFT_CLK  12
+
+#define BTN_UP    6
+#define BTN_DOWN  7
+#define BTN_ENTER 8
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_CLK, TFT_RST);
+
+uint8_t senderMAC[] = {0x94, 0xA9, 0x90, 0xD2, 0xF0, 0x98};
+
+typedef struct {
+  float temp;
+  float humidity;
+  int lightval;
+  bool tempHigh;
+  bool humidHigh;
+  bool lightAlert;
+  char lightStatus[15];
+  int hour;
+  int minute;
+} SensorData;
+
+typedef struct {
+  int tempThreshold;
+  int humidThreshold;
+  bool manualServo;
+} CommandData;
+
+SensorData receivedData;
+CommandData commandToSend;
+bool newDataReceived = false;
+
+enum Screen { MAIN, MENU, SET_TEMP, SET_HUMID, SERVO_CONTROL };
+Screen currentScreen = MAIN;
+int menuIndex = 0;
+int adjustValue = 0;
+
+float prevTemp = -999;
+float prevHumid = -999;
+bool prevTempHigh = false;
+bool prevHumidHigh = false;
+int prevHour = -1;
+int prevMinute = -1;
+char prevLightStatus[15] = "";
+
+const char* menuItems[] = {
+  "Set Temp Thresh",
+  "Set Humid Thresh",
+  "Servo Control",
+  "Back"
+};
+const int menuCount = 4;
+
+// =====================
+// BUTTON DEBOUNCE
+// =====================
+
+bool readButton(int pin) {
+  if (digitalRead(pin) == LOW) {
+    delay(50);
+    if (digitalRead(pin) == LOW) {
+      while (digitalRead(pin) == LOW);
+      delay(50);
+      return true;
+    }
+  }
+  return false;
+}
+
+// =====================
+// MAIN SCREEN
+// =====================
+
+void drawMainLayout() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+
+  tft.setCursor(10, 5);
+  tft.println("=== ENV MONITOR ===");
+  tft.drawFastHLine(0, 28, 240, ST77XX_WHITE);
+
+  tft.setCursor(10, 35);  tft.print("Time:");
+  tft.setCursor(10, 65);  tft.print("Temp:");
+  tft.setCursor(10, 95);  tft.print("Humidity:");
+  tft.setCursor(10, 125); tft.print("Light:");
+
+  tft.drawFastHLine(0, 155, 240, ST77XX_WHITE);
+  tft.setCursor(10, 163); tft.print("Status:");
+  tft.setCursor(10, 193); tft.print("Servo:");
+
+  tft.drawFastHLine(0, 220, 240, ST77XX_WHITE);
+  tft.setCursor(10, 228); tft.print("Temp T:");
+  tft.setCursor(10, 258); tft.print("Humid T:");
+
+  tft.drawFastHLine(0, 290, 240, ST77XX_WHITE);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(10, 298); tft.print("UP = Menu");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(120, 228);
+  tft.print(commandToSend.tempThreshold);
+  tft.print("C");
+  tft.setCursor(130, 258);
+  tft.print(commandToSend.humidThreshold);
+  tft.print("%");
+
+  prevTemp = -999;
+  prevHumid = -999;
+  prevTempHigh = false;
+  prevHumidHigh = false;
+  prevHour = -1;
+  prevMinute = -1;
+  memset(prevLightStatus, 0, 15);
+}
+
+void updateMainValues() {
+  tft.setTextSize(2);
+
+  if (receivedData.hour != prevHour || receivedData.minute != prevMinute) {
+    tft.fillRect(100, 35, 140, 22, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(100, 35);
+    if (receivedData.hour < 10) tft.print("0");
+    tft.print(receivedData.hour);
+    tft.print(":");
+    if (receivedData.minute < 10) tft.print("0");
+    tft.print(receivedData.minute);
+    prevHour = receivedData.hour;
+    prevMinute = receivedData.minute;
+  }
+
+  if (receivedData.temp != prevTemp) {
+    tft.fillRect(100, 65, 140, 22, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(100, 65);
+    tft.print(receivedData.temp);
+    tft.print("C");
+    prevTemp = receivedData.temp;
+  }
+
+  if (receivedData.humidity != prevHumid) {
+    tft.fillRect(160, 95, 80, 22, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(160, 95);
+    tft.print(receivedData.humidity);
+    tft.print("%");
+    prevHumid = receivedData.humidity;
+  }
+
+  if (strcmp(receivedData.lightStatus, prevLightStatus) != 0) {
+    tft.fillRect(100, 125, 140, 22, ST77XX_BLACK);
+    tft.setTextColor(receivedData.lightAlert ? ST77XX_RED : ST77XX_GREEN);
+    tft.setCursor(100, 125);
+    tft.print(receivedData.lightStatus);
+    strncpy(prevLightStatus, receivedData.lightStatus, 15);
+  }
+
+  if (receivedData.tempHigh != prevTempHigh ||
+      receivedData.humidHigh != prevHumidHigh) {
+    tft.fillRect(120, 163, 120, 22, ST77XX_BLACK);
+    tft.fillRect(110, 193, 130, 22, ST77XX_BLACK);
+
+    if (receivedData.tempHigh && receivedData.humidHigh) {
+      tft.setTextColor(ST77XX_RED);
+      tft.setCursor(120, 163); tft.print("WARNING!");
+      tft.setTextColor(ST77XX_YELLOW);
+      tft.setCursor(110, 193); tft.print("OPEN");
+    } else {
+      tft.setTextColor(ST77XX_GREEN);
+      tft.setCursor(120, 163); tft.print("NORMAL");
+      tft.setTextColor(ST77XX_WHITE);
+      tft.setCursor(110, 193); tft.print("CLOSED");
+    }
+
+    prevTempHigh = receivedData.tempHigh;
+    prevHumidHigh = receivedData.humidHigh;
+  }
+}
+
+// =====================
+// MENU SCREENS
+// =====================
+
+void drawMenu() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 5);
+  tft.println("====== MENU ======");
+  tft.drawFastHLine(0, 28, 240, ST77XX_WHITE);
+
+  for (int i = 0; i < menuCount; i++) {
+    tft.setCursor(10, 45 + i * 60);
+    if (i == menuIndex) {
+      tft.setTextColor(ST77XX_YELLOW);
+      tft.print("> ");
+    } else {
+      tft.setTextColor(ST77XX_WHITE);
+      tft.print("  ");
+    }
+    tft.println(menuItems[i]);
+  }
+
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 298);
+  tft.print("UP/DOWN  ENTER=OK");
+}
+
+void drawThresholdScreen(const char* title, int value, const char* unit) {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 5);
+  tft.println(title);
+  tft.drawFastHLine(0, 28, 240, ST77XX_WHITE);
+
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(4);
+  tft.setCursor(60, 120);
+  tft.print(value);
+  tft.print(unit);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(10, 220);
+  tft.print("UP/DOWN to adjust");
+  tft.setCursor(10, 250);
+  tft.print("ENTER to confirm");
+}
+
+void updateThresholdValue(int value, const char* unit) {
+  tft.fillRect(60, 120, 180, 50, ST77XX_BLACK);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(4);
+  tft.setCursor(60, 120);
+  tft.print(value);
+  tft.print(unit);
+}
+
+void drawServoScreen() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 5);
+  tft.println("== SERVO CONTROL ==");
+  tft.drawFastHLine(0, 28, 240, ST77XX_WHITE);
+
+  tft.setCursor(10, 80);
+  tft.print("Current: ");
+  if (commandToSend.manualServo) {
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.println("OPEN");
+  } else {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.println("CLOSED");
+  }
+
+  tft.drawFastHLine(0, 115, 240, ST77XX_WHITE);
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 150);
+  tft.println("ENTER = Toggle");
+  tft.setCursor(10, 190);
+  tft.println("UP    = Back");
+
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 298);
+  tft.print("ENTER=Toggle UP=Back");
+}
+
+// =====================
+// ESP-NOW CALLBACKS
+// =====================
+
+void OnDataReceived(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  memcpy(&receivedData, data, sizeof(receivedData));
+  newDataReceived = true;
+  Serial.println("Data received!");
+}
+
+void OnDataSent(const wifi_tx_info_t *mac_addr, esp_now_send_status_t status) {
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Sent!" : "Failed!");
+}
+
+// =====================
+// SETUP
+// =====================
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_ENTER, INPUT_PULLUP);
+
+  tft.init(240, 320);
+  tft.invertDisplay(true);
+  tft.setRotation(0);
+
+  commandToSend.tempThreshold = 30;
+  commandToSend.humidThreshold = 60;
+  commandToSend.manualServo = false;
+
+  drawMainLayout();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  delay(100);
+
+  esp_now_register_recv_cb(OnDataReceived);
+  esp_now_register_send_cb(OnDataSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, senderMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer!");
+    return;
+  }
+
+  Serial.println("ESP32 #2 ready!");
+}
+
+// =====================
+// LOOP
+// =====================
+
+void loop() {
+
+  bool upPressed = readButton(BTN_UP);
+  bool downPressed = readButton(BTN_DOWN);
+  bool enterPressed = readButton(BTN_ENTER);
+
+  // ---- MAIN SCREEN ----
+  if (currentScreen == MAIN) {
+    if (newDataReceived) {
+      updateMainValues();
+      newDataReceived = false;
+    }
+    if (upPressed) {
+      currentScreen = MENU;
+      menuIndex = 0;
+      drawMenu();
+    }
+  }
+
+  // ---- MENU ----
+  else if (currentScreen == MENU) {
+    if (upPressed) {
+      menuIndex--;
+      if (menuIndex < 0) menuIndex = menuCount - 1;
+      drawMenu();
+    }
+    if (downPressed) {
+      menuIndex++;
+      if (menuIndex >= menuCount) menuIndex = 0;
+      drawMenu();
+    }
+    if (enterPressed) {
+      if (menuIndex == 0) {
+        currentScreen = SET_TEMP;
+        adjustValue = commandToSend.tempThreshold;
+        drawThresholdScreen("SET TEMP THRESH", adjustValue, "C");
+      } else if (menuIndex == 1) {
+        currentScreen = SET_HUMID;
+        adjustValue = commandToSend.humidThreshold;
+        drawThresholdScreen("SET HUMID THRESH", adjustValue, "%");
+      } else if (menuIndex == 2) {
+        currentScreen = SERVO_CONTROL;
+        drawServoScreen();
+      } else if (menuIndex == 3) {
+        currentScreen = MAIN;
+        drawMainLayout();
+      }
+    }
+  }
+
+  // ---- SET TEMP ----
+  else if (currentScreen == SET_TEMP) {
+    if (upPressed) {
+      adjustValue++;
+      if (adjustValue > 50) adjustValue = 50;
+      updateThresholdValue(adjustValue, "C");
+    }
+    if (downPressed) {
+      adjustValue--;
+      if (adjustValue < 0) adjustValue = 0;
+      updateThresholdValue(adjustValue, "C");
+    }
+    if (enterPressed) {
+      commandToSend.tempThreshold = adjustValue;
+      esp_now_send(senderMAC, (uint8_t *)&commandToSend, sizeof(commandToSend));
+      Serial.print("New temp threshold: ");
+      Serial.println(commandToSend.tempThreshold);
+      currentScreen = MAIN;
+      drawMainLayout();
+    }
+  }
+
+  // ---- SET HUMID ----
+  else if (currentScreen == SET_HUMID) {
+    if (upPressed) {
+      adjustValue++;
+      if (adjustValue > 100) adjustValue = 100;
+      updateThresholdValue(adjustValue, "%");
+    }
+    if (downPressed) {
+      adjustValue--;
+      if (adjustValue < 0) adjustValue = 0;
+      updateThresholdValue(adjustValue, "%");
+    }
+    if (enterPressed) {
+      commandToSend.humidThreshold = adjustValue;
+      esp_now_send(senderMAC, (uint8_t *)&commandToSend, sizeof(commandToSend));
+      Serial.print("New humid threshold: ");
+      Serial.println(commandToSend.humidThreshold);
+      currentScreen = MAIN;
+      drawMainLayout();
+    }
+  }
+
+  // ---- SERVO CONTROL ----
+  else if (currentScreen == SERVO_CONTROL) {
+    if (enterPressed) {
+      commandToSend.manualServo = !commandToSend.manualServo;
+      esp_now_send(senderMAC, (uint8_t *)&commandToSend, sizeof(commandToSend));
+      Serial.print("Servo: ");
+      Serial.println(commandToSend.manualServo ? "OPEN" : "CLOSED");
+      drawServoScreen();
+    }
+    if (upPressed) {
+      currentScreen = MAIN;
+      drawMainLayout();
+    }
+  }
+
+  esp_now_send(senderMAC, (uint8_t *)&commandToSend, sizeof(commandToSend));
+  delay(50);
+}
